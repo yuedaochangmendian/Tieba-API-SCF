@@ -31,5 +31,32 @@ await build({
 				builder.onResolve({ filter: /^undici$/ }, () => ({ path: undiciShim }));
 			},
 		},
+		{
+			// Workers 上没有 pg 需要的 net/tls 组合，且 pg 在模块初始化时就会
+			// require("events")，导致整包加载失败。这里换成惰性抛错的桩：
+			// 不碰数据库的接口照常工作，DB 相关接口在调用时给出明确提示。
+			name: "pg-unavailable",
+			setup(builder) {
+				builder.onResolve({ filter: /^(pg|pg-native)$/ }, () => ({
+					path: "pg-unavailable",
+					namespace: "pg-unavailable",
+				}));
+				builder.onLoad(
+					{ filter: /.*/, namespace: "pg-unavailable" },
+					() => ({
+						contents: `export class Pool {
+	constructor() {
+		throw new Error(
+			"此部署未连接 Postgres：DATABASE_URL 未配置，数据库相关接口不可用",
+		);
+	}
+}
+export default { Pool };
+`,
+						loader: "js",
+					}),
+				);
+			},
+		},
 	],
 });
