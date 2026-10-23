@@ -375,10 +375,12 @@ export const exportRoute = new Hono()
 
 						const pageResults = await scanThreadPages(batch);
 
+						let added = 0;
 						for (const pageResult of pageResults) {
 							for (const thread of pageResult?.threadList ?? []) {
 								if (thread.isTop) continue;
 								threads.push(thread);
+								added += 1;
 								if (threads.length >= threadCount) break;
 							}
 							if (threads.length >= threadCount) break;
@@ -392,6 +394,9 @@ export const exportRoute = new Hono()
 								total: totalScanPages,
 							}),
 						});
+
+						// 整批都没有新主题，说明该吧已经翻到底，停止继续请求。
+						if (added === 0) break;
 					}
 
 					await stream.writeSSE({
