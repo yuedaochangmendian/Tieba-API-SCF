@@ -13,6 +13,31 @@ import { getDb } from "../db/index.ts";
 import { ExportRepository } from "../export-mode/repository.ts";
 import { MethodEnum, UserIdResolver } from "../utils/format.ts";
 
+/** 贴吧列表接口单页最多返回 30 条主题，扫描时按页累加。 */
+const THREAD_PAGE_SIZE = 30;
+/** 每轮并发拉取的列表页数，避免一次性构造过多 Effect。 */
+const THREAD_SCAN_BATCH = 10;
+const DEFAULT_THREAD_COUNT = 50;
+const DEFAULT_THREAD_POST_PAGES = 5;
+
+/**
+ * 运维侧可选上限：未设置或 <= 0 表示不限制（默认）。
+ * 需要保护后端时再设置 EXPORT_MAX_THREADS / EXPORT_MAX_THREAD_PAGES。
+ */
+function readLimitFromEnv(name: string): number | undefined {
+	const env = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+		.process?.env;
+	const raw = env?.[name];
+	if (!raw) return undefined;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+}
+
+function toPositiveInteger(raw: string, fallback: number): number {
+	const parsed = Math.floor(Number(raw));
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 const userPostsQuery = z
 	.object({
 		method: z
@@ -41,7 +66,7 @@ const forumThreadsQuery = z
 			.string()
 			.optional()
 			.default("50")
-			.describe("导出主题数量，范围 1~300"),
+			.describe("导出主题数量，正整数，默认 50；未配置 EXPORT_MAX_THREADS 时不限制"),
 		depth: z
 			.enum(["first", "all"])
 			.optional()
@@ -56,7 +81,9 @@ const forumThreadsQuery = z
 			.string()
 			.optional()
 			.default("5")
-			.describe("每个主题最多抓取楼层页数（depth=all 时生效）"),
+			.describe(
+				"每个主题最多抓取楼层页数（depth=all 时生效）；未配置 EXPORT_MAX_THREAD_PAGES 时不限制",
+			),
 	})
 	.describe("贴吧主题导出参数");
 
@@ -299,28 +326,73 @@ export const exportRoute = new Hono()
 			const { fname, sort, count, depth, withComments, maxPages } =
 				c.req.valid("query");
 			const includeComments = withComments === "true";
-			const threadCount = Math.min(Math.max(Number(count) || 50, 1), 300);
-			const maxThreadPostPages = Math.min(
-				Math.max(Number(maxPages) || 5, 1),
-				20,
+			const requestedCount = toPositiveInteger(count, DEFAULT_THREAD_COUNT);
+			const countCeiling = readLimitFromEnv("EXPORT_MAX_THREADS");
+			const threadCount = countCeiling
+				? Math.min(requestedCount, countCeiling)
+				: requestedCount;
+
+			const requestedPages = toPositiveInteger(
+				maxPages,
+				DEFAULT_THREAD_POST_PAGES,
 			);
-			const pages = Math.ceil(threadCount / 30);
+			const pageCeiling = readLimitFromEnv("EXPORT_MAX_THREAD_PAGES");
+			const maxThreadPostPages = pageCeiling
+				? Math.min(requestedPages, pageCeiling)
+				: requestedPages;
+
 			const sortType = Number(sort) || 1;
+			const totalScanPages = Math.ceil(threadCount / THREAD_PAGE_SIZE);
+
+			const scanPageEffect = (page: number) =>
+				getThreads({ fname, page, sort: sortType, rn: THREAD_PAGE_SIZE });
+			const scanThreadPages = (pages: number[]) =>
+				Effect.runPromise(
+					Effect.all(pages.map(scanPageEffect), { concurrency: 5 }),
+				);
+			type ScannedPage = NonNullable<
+				Awaited<ReturnType<typeof scanThreadPages>>[number]
+			>;
+			type ThreadItem = NonNullable<ScannedPage["threadList"]>[number];
 
 			return streamSSE(c, async (stream) => {
 				try {
-					const pageResults = await Effect.runPromise(
-						Effect.all(
-							Array.from({ length: pages }, (_, i) =>
-								getThreads({ fname, page: i + 1, sort: sortType, rn: 30 }),
-							),
-							{ concurrency: 5 },
-						),
-					);
-					let threads = pageResults.flatMap((res) => res?.threadList ?? []);
-					threads = threads
-						.filter((thread) => !thread.isTop)
-						.slice(0, threadCount);
+					const threads: ThreadItem[] = [];
+					let scannedPages = 0;
+					// 分批扫描列表页：既避免一次性构造过量请求，也能在够数后提前停止。
+					while (
+						scannedPages < totalScanPages &&
+						threads.length < threadCount
+					) {
+						const batch: number[] = [];
+						for (
+							let i = 0;
+							i < THREAD_SCAN_BATCH && scannedPages + i < totalScanPages;
+							i += 1
+						) {
+							batch.push(scannedPages + i + 1);
+						}
+
+						const pageResults = await scanThreadPages(batch);
+
+						for (const pageResult of pageResults) {
+							for (const thread of pageResult?.threadList ?? []) {
+								if (thread.isTop) continue;
+								threads.push(thread);
+								if (threads.length >= threadCount) break;
+							}
+							if (threads.length >= threadCount) break;
+						}
+
+						scannedPages += batch.length;
+						await stream.writeSSE({
+							data: JSON.stringify({
+								type: "page",
+								page: scannedPages,
+								total: totalScanPages,
+							}),
+						});
+					}
 
 					await stream.writeSSE({
 						data: JSON.stringify({
